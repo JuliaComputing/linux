@@ -454,7 +454,7 @@ static int xfeature_uncompacted_offset(int xfeature_nr)
 	return ebx;
 }
 
-static int xfeature_size(int xfeature_nr)
+int xfeature_size(int xfeature_nr)
 {
 	u32 eax, ebx, ecx, edx;
 
@@ -462,6 +462,7 @@ static int xfeature_size(int xfeature_nr)
 	cpuid_count(XSTATE_CPUID, xfeature_nr, &eax, &ebx, &ecx, &edx);
 	return eax;
 }
+EXPORT_SYMBOL_GPL(xfeature_size);
 
 /*
  * 'XSAVES' implies two different things:

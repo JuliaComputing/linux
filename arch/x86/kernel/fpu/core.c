@@ -101,6 +101,8 @@ void __kernel_fpu_begin(void)
 	kernel_fpu_disable();
 
 	if (fpu->initialized) {
+		if (unlikely(test_thread_flag(TIF_MASKXCR0)))
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
 		/*
 		 * Ignore return value -- we don't care if reg state
 		 * is clobbered.
@@ -116,8 +118,14 @@ void __kernel_fpu_end(void)
 {
 	struct fpu *fpu = &current->thread.fpu;
 
-	if (fpu->initialized)
+	if (fpu->initialized) {
 		copy_kernel_to_fpregs(&fpu->state);
+
+		if (unlikely(test_thread_flag(TIF_MASKXCR0))) {
+			xsetbv(XCR_XFEATURE_ENABLED_MASK,
+				   xfeatures_mask & ~current->thread.xcr0_mask);
+		}
+	}
 
 	kernel_fpu_enable();
 }

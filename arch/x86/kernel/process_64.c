@@ -469,6 +469,15 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	load_seg_legacy(prev->gsindex, prev->gsbase,
 			next->gsindex, next->gsbase, GS);
 
+	/*
+	 * Now maybe reload the debug registers and handle I/O bitmaps.
+	 * N.B.: This may change XCR0 and must thus happen before,
+	 * `switch_fpu_finish`.
+	 */
+	if (unlikely(task_thread_info(next_p)->flags & _TIF_WORK_CTXSW_NEXT ||
+		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
+		__switch_to_xtra(prev_p, next_p, tss);
+
 	switch_fpu_finish(next_fpu, cpu);
 
 	/*
@@ -479,13 +488,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 
 	/* Reload sp0. */
 	update_sp0(next_p);
-
-	/*
-	 * Now maybe reload the debug registers and handle I/O bitmaps
-	 */
-	if (unlikely(task_thread_info(next_p)->flags & _TIF_WORK_CTXSW_NEXT ||
-		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
-		__switch_to_xtra(prev_p, next_p, tss);
 
 #ifdef CONFIG_XEN_PV
 	/*

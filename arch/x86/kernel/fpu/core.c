@@ -104,6 +104,8 @@ static void __kernel_fpu_begin(void)
 	if (current->mm) {
 		if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
 			set_thread_flag(TIF_NEED_FPU_LOAD);
+			if (unlikely(test_thread_flag(TIF_MASKXCR0)))
+				xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
 			/*
 			 * Ignore return value -- we don't care if reg state
 			 * is clobbered.
@@ -319,12 +321,19 @@ static inline void copy_init_fpstate_to_fpregs(void)
 {
 	fpregs_lock();
 
-	if (use_xsave())
+
+	if (use_xsave()) {
+		if (unlikely(test_thread_flag(TIF_MASKXCR0)))
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
 		copy_kernel_to_xregs(&init_fpstate.xsave, -1);
-	else if (static_cpu_has(X86_FEATURE_FXSR))
+		if (unlikely(test_thread_flag(TIF_MASKXCR0)))
+			xsetbv(XCR_XFEATURE_ENABLED_MASK,
+				xfeatures_mask & ~current->thread.xcr0_mask);
+	} else if (static_cpu_has(X86_FEATURE_FXSR)) {
 		copy_kernel_to_fxregs(&init_fpstate.fxsave);
-	else
+	} else {
 		copy_kernel_to_fregs(&init_fpstate.fsave);
+	}
 
 	if (boot_cpu_has(X86_FEATURE_OSPKE))
 		copy_init_pkru_to_fpregs();

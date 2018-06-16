@@ -569,6 +569,13 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	x86_fsgsbase_load(prev, next);
 
 	/*
+	 * Now maybe reload the debug registers and handle I/O bitmaps.
+	 * N.B.: This may change XCR0 and must thus happen before,
+	 * `switch_fpu_finish`.
+	 */
+	switch_to_extra(prev_p, next_p);
+
+	/*
 	 * Switch the PDA and FPU contexts.
 	 */
 	this_cpu_write(current_task, next_p);
@@ -578,8 +585,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 
 	/* Reload sp0. */
 	update_task_stack(next_p);
-
-	switch_to_extra(prev_p, next_p);
 
 #ifdef CONFIG_XEN_PV
 	/*

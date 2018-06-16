@@ -247,6 +247,55 @@ static int set_cpuid_mode(struct task_struct *task, unsigned long cpuid_enabled)
 	return 0;
 }
 
+static void change_xcr0_mask(unsigned long prev_mask, unsigned long next_mask)
+{
+	unsigned long deactivated_features = next_mask & ~prev_mask;
+
+	if (deactivated_features) {
+		/*
+		 * Clear any state components that were active before,
+		 * but are not active now (xrstor would not touch
+		 * it otherwise, exposing the previous values).
+		 */
+		xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
+		__copy_kernel_to_fpregs(&init_fpstate, deactivated_features);
+	}
+
+	xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask & ~next_mask);
+}
+
+void reset_xcr0_mask(void)
+{
+	preempt_disable();
+	if (test_and_clear_thread_flag(TIF_MASKXCR0)) {
+		current->thread.xcr0_mask = 0;
+		xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
+	}
+	preempt_enable();
+}
+
+void set_xcr0_mask(unsigned long mask)
+{
+	if (mask == 0) {
+		reset_xcr0_mask();
+	} else {
+		struct xregs_state *xsave = &current->thread.fpu.state.xsave;
+
+		preempt_disable();
+
+		change_xcr0_mask(current->thread.xcr0_mask, mask);
+
+		xsave->header.xfeatures = xsave->header.xfeatures & ~mask;
+		/* TODO: We may have to compress the xstate here */
+		xsave->header.xcomp_bv = xsave->header.xcomp_bv & ~mask;
+
+		set_thread_flag(TIF_MASKXCR0);
+		current->thread.xcr0_mask = mask;
+
+		preempt_enable();
+	}
+}
+
 /*
  * Called immediately after a successful exec.
  */
@@ -255,7 +304,6 @@ void arch_setup_new_exec(void)
 	/* If cpuid was previously disabled for this task, re-enable it. */
 	if (test_thread_flag(TIF_NOCPUID))
 		enable_cpuid();
-
 	/*
 	 * Don't inherit TIF_SSBD across exec boundary when
 	 * PR_SPEC_DISABLE_NOEXEC is used.
@@ -267,6 +315,9 @@ void arch_setup_new_exec(void)
 		task_clear_spec_ssb_noexec(current);
 		speculation_ctrl_update(task_thread_info(current)->flags);
 	}
+	/* Don't inherit XCR0 masking across exec boundaries */
+	if (test_thread_flag(TIF_MASKXCR0))
+		reset_xcr0_mask();
 }
 
 static inline void switch_to_bitmap(struct thread_struct *prev,
@@ -526,15 +577,12 @@ void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p)
 	if ((tifp ^ tifn) & _TIF_NOCPUID)
 		set_cpuid_faulting(!!(tifn & _TIF_NOCPUID));
 
-	if (likely(!((tifp | tifn) & _TIF_SPEC_FORCE_UPDATE))) {
-		__speculation_ctrl_update(tifp, tifn);
-	} else {
-		speculation_ctrl_update_tif(prev_p);
-		tifn = speculation_ctrl_update_tif(next_p);
-
-		/* Enforce MSR update to ensure consistent state */
-		__speculation_ctrl_update(~tifn, tifn);
-	}
+	if ((tifp | tifn) & _TIF_MASKXCR0 &&
+	    ((prev->xcr0_mask != next->xcr0_mask) ||
+		 (tifn & TIF_NEED_FPU_LOAD)))
+		change_xcr0_mask((tifn & TIF_NEED_FPU_LOAD) ?
+			xfeatures_mask :
+			prev->xcr0_mask, next->xcr0_mask);
 }
 
 /*
@@ -863,14 +911,80 @@ out:
 	return ret;
 }
 
+static int xcr0_is_legal(unsigned long xcr0)
+{
+	// Conservatively disallow anything above bit 9,
+	// to avoid accidentally allowing the disabling of
+	// new features without updating these checks
+	if (xcr0 & ~((1 << 10) - 1))
+		return 0;
+	if (!(xcr0 & XFEATURE_MASK_FP))
+		return 0;
+	if ((xcr0 & XFEATURE_MASK_YMM) && !(xcr0 & XFEATURE_MASK_SSE))
+		return 0;
+	if ((!(xcr0 & XFEATURE_MASK_BNDREGS)) !=
+	    (!(xcr0 & XFEATURE_MASK_BNDCSR)))
+		return 0;
+	if (xcr0 & XFEATURE_MASK_AVX512) {
+		if (!(xcr0 & XFEATURE_MASK_YMM))
+			return 0;
+		if ((xcr0 & XFEATURE_MASK_AVX512) != XFEATURE_MASK_AVX512)
+			return 0;
+	}
+	return 1;
+}
+
+static int xstate_is_initial(unsigned long mask)
+{
+	int i, j;
+	unsigned long max_bit = __ffs(mask);
+
+	for (i = 0; i < max_bit; ++i) {
+		if (mask & (1 << i)) {
+			char *xfeature_addr = (char *)get_xsave_addr(
+					&current->thread.fpu.state.xsave,
+					1 << i);
+			unsigned long feature_size = xfeature_size(i);
+
+			for (j = 0; j < feature_size; ++j) {
+				if (xfeature_addr[j] != 0)
+					return 0;
+			}
+		}
+	}
+	return 1;
+}
+
 long do_arch_prctl_common(struct task_struct *task, int option,
-			  unsigned long cpuid_enabled)
+			  unsigned long arg2)
 {
 	switch (option) {
 	case ARCH_GET_CPUID:
 		return get_cpuid_mode();
 	case ARCH_SET_CPUID:
-		return set_cpuid_mode(task, cpuid_enabled);
+		return set_cpuid_mode(task, arg2);
+	case ARCH_SET_XCR0: {
+		unsigned long mask = xfeatures_mask & ~arg2;
+
+		if (!use_xsave())
+			return -ENODEV;
+
+		if (arg2 & ~xfeatures_mask)
+			return -ENODEV;
+
+		if (!xcr0_is_legal(arg2))
+			return -EINVAL;
+
+		/*
+		 * We require that any state components being disabled by
+		 * this prctl be currently in their initial state.
+		 */
+		if (!xstate_is_initial(mask))
+			return -EPERM;
+
+		set_xcr0_mask(mask);
+		return 0;
+	}
 	}
 
 	return -EINVAL;

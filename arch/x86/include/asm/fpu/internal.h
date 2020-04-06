@@ -15,6 +15,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/jump_label_ratelimit.h>
 
 #include <asm/user.h>
 #include <asm/fpu/api.h>
@@ -315,6 +316,33 @@ static inline void copy_kernel_to_xregs_booting(struct xregs_state *xstate)
 }
 
 /*
+ * MXCSR and XCR definitions:
+ */
+
+extern unsigned int mxcsr_feature_mask;
+
+#define XCR_XFEATURE_ENABLED_MASK	0x00000000
+
+static inline u64 xgetbv(u32 index)
+{
+	u32 eax, edx;
+
+	asm volatile(".byte 0x0f,0x01,0xd0" /* xgetbv */
+		     : "=a" (eax), "=d" (edx)
+		     : "c" (index));
+	return eax + ((u64)edx << 32);
+}
+
+static inline void xsetbv(u32 index, u64 value)
+{
+	u32 eax = value;
+	u32 edx = value >> 32;
+
+	asm volatile(".byte 0x0f,0x01,0xd1" /* xsetbv */
+		     : : "a" (eax), "d" (edx), "c" (index));
+}
+
+/*
  * Save processor xstate to xsave area.
  */
 static inline void copy_xregs_to_kernel(struct xregs_state *xstate)
@@ -325,6 +353,12 @@ static inline void copy_xregs_to_kernel(struct xregs_state *xstate)
 	int err;
 
 	WARN_ON_FPU(!alternatives_patched);
+
+	if (static_branch_unlikely(&xcr0_switching_active.key)) {
+		if (unlikely(xgetbv(XCR_XFEATURE_ENABLED_MASK) != xfeatures_mask)) {
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
+		}
+	}
 
 	XSTATE_XSAVE(xstate, lmask, hmask, err);
 
@@ -339,6 +373,10 @@ static inline void copy_kernel_to_xregs(struct xregs_state *xstate, u64 mask)
 {
 	u32 lmask = mask;
 	u32 hmask = mask >> 32;
+
+	if (unlikely(xgetbv(XCR_XFEATURE_ENABLED_MASK) != xfeatures_mask)) {
+		xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
+	}
 
 	XSTATE_XRESTORE(xstate, lmask, hmask);
 }
@@ -613,33 +651,6 @@ static inline void switch_fpu_finish(struct fpu *new_fpu)
 			pkru_val = pk->pkru;
 	}
 	__write_pkru(pkru_val);
-}
-
-/*
- * MXCSR and XCR definitions:
- */
-
-extern unsigned int mxcsr_feature_mask;
-
-#define XCR_XFEATURE_ENABLED_MASK	0x00000000
-
-static inline u64 xgetbv(u32 index)
-{
-	u32 eax, edx;
-
-	asm volatile(".byte 0x0f,0x01,0xd0" /* xgetbv */
-		     : "=a" (eax), "=d" (edx)
-		     : "c" (index));
-	return eax + ((u64)edx << 32);
-}
-
-static inline void xsetbv(u32 index, u64 value)
-{
-	u32 eax = value;
-	u32 edx = value >> 32;
-
-	asm volatile(".byte 0x0f,0x01,0xd1" /* xsetbv */
-		     : : "a" (eax), "d" (edx), "c" (index));
 }
 
 #endif /* _ASM_X86_FPU_INTERNAL_H */

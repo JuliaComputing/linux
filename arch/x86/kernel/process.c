@@ -92,6 +92,9 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 	dst->thread.vm86 = NULL;
 #endif
 
+	if (unlikely(dst->thread.xcr0))
+		static_branch_deferred_inc(&xcr0_switching_active);
+
 	return fpu__copy(dst, src);
 }
 
@@ -107,6 +110,9 @@ void exit_thread(struct task_struct *tsk)
 		io_bitmap_exit();
 
 	free_vm86(t);
+
+	if (unlikely(t->xcr0))
+		static_branch_slow_dec_deferred(&xcr0_switching_active);
 
 	fpu__drop(fpu);
 }
@@ -980,15 +986,107 @@ out:
 	return ret;
 }
 
+static int xcr0_is_legal(unsigned long xcr0)
+{
+	/* Conservatively disallow anything above bit 9,
+	 * to avoid accidentally allowing the disabling of
+	 * new features without updating these checks
+	 */
+	if (xcr0 & ~((1 << 10) - 1))
+		return 0;
+	if (!(xcr0 & XFEATURE_MASK_FP))
+		return 0;
+	if ((xcr0 & XFEATURE_MASK_YMM) && !(xcr0 & XFEATURE_MASK_SSE))
+		return 0;
+	if ((!(xcr0 & XFEATURE_MASK_BNDREGS)) !=
+		(!(xcr0 & XFEATURE_MASK_BNDCSR)))
+		return 0;
+	if (xcr0 & XFEATURE_MASK_AVX512) {
+		if (!(xcr0 & XFEATURE_MASK_YMM))
+			return 0;
+		if ((xcr0 & XFEATURE_MASK_AVX512) != XFEATURE_MASK_AVX512)
+			return 0;
+	}
+	return 1;
+}
+
+static int xstate_is_initial(unsigned long mask)
+{
+	int i, j;
+	unsigned long max_bit = __ffs(mask);
+
+	for (i = 0; i < max_bit; ++i) {
+		if (mask & (1 << i)) {
+			char *xfeature_addr = (char *)get_xsave_addr(
+				&current->thread.fpu.state.xsave,
+				1 << i);
+			unsigned long feature_size = xfeature_size(i);
+
+			for (j = 0; j < feature_size; ++j) {
+				if (xfeature_addr[j] != 0)
+					return 0;
+			}
+		}
+	}
+	return 1;
+}
+
 long do_arch_prctl_common(struct task_struct *task, int option,
-			  unsigned long cpuid_enabled)
+			  unsigned long arg2)
 {
 	switch (option) {
 	case ARCH_GET_CPUID:
 		return get_cpuid_mode();
 	case ARCH_SET_CPUID:
-		return set_cpuid_mode(task, cpuid_enabled);
-	}
+		return set_cpuid_mode(task, arg2);
+	case ARCH_SET_XCR0: {
+		if (!use_xsave())
+			return -ENODEV;
 
-	return -EINVAL;
+		/* Do not allow enabling xstate components that the kernel doesn't
+		know about */
+		if (arg2 & ~xfeatures_mask)
+			return -ENODEV;
+
+		/* Do not allow xcr0 values that the hardware would refuse to load
+		later */
+		if (!xcr0_is_legal(arg2))
+			return -EINVAL;
+
+		/*
+		* We require that any state components being disabled by
+		* this prctl be currently in their initial state.
+		*/
+		if (!xstate_is_initial(arg2))
+			return -EPERM;
+
+		if (arg2 == xfeatures_mask) {
+			if (!current->thread.xcr0) {
+				return 0;
+			}
+
+			/* A value of zero here means to use the kernel's xfeature mask,
+			* so restore that value here */
+			current->thread.xcr0 = 0;
+			xsetbv(XCR_XFEATURE_ENABLED_MASK, xfeatures_mask);
+			static_branch_slow_dec_deferred(&xcr0_switching_active);
+		} else {
+			if (arg2 == current->thread.xcr0) {
+				return 0;
+			}
+			if (!current->thread.xcr0) {
+				static_branch_deferred_inc(&xcr0_switching_active);
+			}
+
+			current->thread.xcr0 = arg2;
+			/* Ask to restore the FPU on userspace exit, which will restore our
+			requested XCR0 value */
+			set_thread_flag(TIF_NEED_FPU_LOAD);
+		}
+
+		return 0;
+	}
+	default:
+		return -EINVAL;
+	}
 }

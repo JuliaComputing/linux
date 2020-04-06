@@ -341,6 +341,14 @@ void switch_fpu_return(void)
 		return;
 
 	__fpregs_load_activate();
+
+	if (static_branch_unlikely(&xcr0_switching_active.key)) {
+		if (unlikely(current->thread.xcr0)) {
+			if (xgetbv(XCR_XFEATURE_ENABLED_MASK) != current->thread.xcr0) {
+				xsetbv(XCR_XFEATURE_ENABLED_MASK, current->thread.xcr0);
+			}
+		}
+	}
 }
 EXPORT_SYMBOL_GPL(switch_fpu_return);
 

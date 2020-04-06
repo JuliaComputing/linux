@@ -521,6 +521,8 @@ struct thread_struct {
 	unsigned long           debugreg6;
 	/* Keep track of the exact dr7 value set by the user */
 	unsigned long           ptrace_dr7;
+	/* Keep track of the exact XCR0 set by the user */
+	unsigned long           xcr0;
 	/* Fault info: */
 	unsigned long		cr2;
 	unsigned long		trap_nr;
